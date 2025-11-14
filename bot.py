@@ -17,13 +17,24 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup([
 ], resize_keyboard=True)
 CANCEL_KEYBOARD = ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
 
+# --- Helper: Get Main Menu Inline Keyboard ---
+def get_main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎮 Play 1v1", callback_data="menu_play")],
+        [InlineKeyboardButton("💰 Wallet", callback_data="menu_wallet"), InlineKeyboardButton("📋 Profile", callback_data="menu_profile")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="menu_leaderboard"), InlineKeyboardButton("📜 Rules", callback_data="menu_rules")]
+    ])
+
 # --- Core Functions (Unaltered) ---
 async def ensure_user(update: Update, referrer_id: int = None):
     user_obj = update.effective_user
     if not user_obj: return None
     if not await db.get_user(user_obj.id):
         await db.create_user_if_not_exists(user_obj.id, user_obj.username or user_obj.first_name, referrer_id)
-    return await db.get_user(user_obj.id)
+    user = await db.get_user(user_obj.id)
+    if user and user.get('is_banned'):
+        return None  # User is banned
+    return user
 async def check_channel_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     if user_id in config.ADMINS: return True
@@ -43,7 +54,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; args = context.args
     referrer_id = int(args[0].split('_')[1]) if args and args[0].startswith('ref_') else None
     db_user = await ensure_user(update, referrer_id)
-    if not db_user: return await update.message.reply_text("দুঃখিত, আপনার প্রোফাইল তৈরি করতে একটি সমস্যা হয়েছে।")
+    
+    # Check if user is banned
+    raw_user = await db.get_user(user.id)
+    if raw_user and raw_user.get('is_banned'):
+        return await update.message.reply_text("❌ আপনার একাউন্ট ব্যান করা হয়েছে। আপিল করতে অ্যাডমিনের সাথে যোগাযোগ করুন।")
+    
+    if not db_user: return await update.message.reply_text("দুঃখিত, আপনার প্রোফাইল তৈরি করতে একটি সমস্যা হয়েছে।")
     if not await check_channel_member(update, context): return
     if db_user.get('is_registered'): await update.message.reply_text('আপনাকে স্বাগতম!', reply_markup=MAIN_KEYBOARD)
     else:
@@ -52,7 +69,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await ensure_user(update)
-    if not user: return await update.message.reply_text("আপনার একাউন্টে সমস্যা। /start কমান্ড দিন।")
+    if not user:
+        raw_user = await db.get_user(update.effective_user.id)
+        if raw_user and raw_user.get('is_banned'):
+            return await update.message.reply_text("❌ আপনার একাউন্ট ব্যান করা হয়েছে।")
+        return await update.message.reply_text("আপনার একাউন্টে সমস্যা। /start কমান্ড দিন।")
     
     txt = update.message.text.strip()
     
@@ -60,6 +81,7 @@ async def main_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await rules_command(update, context)
 
     state, state_data = user.get('state'), user.get('state_data')
+    
     if txt == "❌ Cancel":
         await db.set_user_state(user['user_id'], None)
         queue_entry = await db.get_from_queue(user['user_id'])
@@ -114,9 +136,24 @@ async def main_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req_id = await db.create_withdrawal_request(user['user_id'], data['amount'], data['method'], txt)
         await update.message.reply_text('আপনার উইথড্র অনুরোধ গ্রহণ করা হয়েছে।', reply_markup=MAIN_KEYBOARD)
         for aid in config.ADMINS:
-            try: await context.bot.send_message(aid, (f"새로운 인출 요청! (ID: {req_id})\nUser: {user['user_id']} ({user.get('ingame_name')})\nAmount: {data['amount']} TK\nMethod: {data['method']}\nNumber: {txt}\n/approve_withdrawal {req_id}\n/reject_withdrawal {req_id}"))
+            try: await context.bot.send_message(aid, (f"নতুন উইথড্র অনুরোধ! (ID: {req_id})\nUser: {user['user_id']} ({user.get('ingame_name')})\nAmount: {data['amount']} TK\nMethod: {data['method']}\nNumber: {txt}\n/approve_withdrawal {req_id}\n/reject_withdrawal {req_id}"))
             except Exception: pass
         return await db.set_user_state(user['user_id'], None)
+    
+    if state == 'admin_setbal_amount':
+        try:
+            if user['user_id'] not in config.ADMINS:
+                return await update.message.reply_text("অনুমতি নেই।")
+            new_amount = float(txt)
+            target_user_id = int(state_data)
+            current_balance = (await db.get_user(target_user_id)).get('balance', 0)
+            await db.update_user_fields(target_user_id, {'balance': new_amount})
+            await update.message.reply_text(f"✅ ব্যবহারকারী {target_user_id} এর ব্যালেন্স {current_balance:.2f} থেকে {new_amount:.2f} TK এ পরিবর্তন করা হয়েছে।")
+            await context.bot.send_message(target_user_id, f"📝 আপনার ব্যালেন্স আপডেট করা হয়েছে। নতুন ব্যালেন্স: {new_amount:.2f} TK")
+        except ValueError:
+            await update.message.reply_text("❌ সঠিক সংখ্যা লিখুন।")
+        finally:
+            await db.set_user_state(user['user_id'], None)
 
     # --- Menu Button Actions (Unaltered) ---
     if txt == "🎮 Play 1v1": return await play_1v1_menu(update, context)
@@ -165,9 +202,19 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ... (Unaltered) ...
     query = update.callback_query; await query.answer(); data = query.data; user_id = query.from_user.id
+    
+    # Menu navigation
+    if data == "menu_play": return await play_1v1_menu(update, context)
+    if data == "menu_wallet": return await wallet_menu(update, context)
+    if data == "menu_profile": return await show_profile(update, context)
+    if data == "menu_leaderboard": return await show_leaderboard(update, context)
+    if data == "menu_rules": return await rules_command(update, context)
+    
     if data.startswith('play_fee_'): await handle_play_request(update, context)
     elif data.startswith('cancel_'): await cancel_search(update, context)
     elif data.startswith('admin_res_'): await admin_resolve_match(update, context)
+    elif data.startswith('admin_ban_'): await handle_ban_callback(update, context)
+    elif data.startswith('admin_setbal_'): await handle_setbalance_callback(update, context)
     elif data == 'deposit': await query.message.reply_text(f"ন্যূনতম ডিপোজিট {config.MINIMUM_DEPOSIT:.2f} TK।\n\nBkash/Nagad (Send Money): `{config.BKASH_NUMBER}`\nটাকা পাঠিয়ে Transaction ID সহ এভাবে লিখুন:\n`TX123ABC 500`", parse_mode='Markdown')
     elif data == 'withdraw':
         user = await db.get_user(user_id)
@@ -243,6 +290,25 @@ async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         await query.message.edit_text("আপনার ম্যাচ খোঁজা বাতিল করা হয়েছে।")
     else: await query.message.edit_text("আপনি কোনো ম্যাচ খুঁজছেন না।")
+
+async def handle_ban_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback handler for banning users."""
+    query = update.callback_query
+    if query.from_user.id not in config.ADMINS:
+        return await query.answer("অনুমতি নেই।", show_alert=True)
+    target_user_id = int(query.data.split('_')[-1])
+    await db.update_user_fields(target_user_id, {'is_banned': 1})
+    await query.edit_message_text(f"✅ ব্যবহারকারী {target_user_id} ব্যান করা হয়েছে।")
+
+async def handle_setbalance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback handler for setting user balance."""
+    query = update.callback_query
+    if query.from_user.id not in config.ADMINS:
+        return await query.answer("অনুমতি নেই।", show_alert=True)
+    target_user_id = int(query.data.split('_')[-1])
+    await db.set_user_state(query.from_user.id, 'admin_setbal_amount', str(target_user_id))
+    await query.message.reply_text("নতুন ব্যালেন্স পরিমাণ লিখুন:")
+
 async def admin_resolve_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     if query.from_user.id not in config.ADMINS: return
@@ -263,6 +329,7 @@ async def admin_resolve_match(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Error in admin_resolve_match: {e}", exc_info=True)
         try: await query.edit_message_caption(caption="❌ একটি ত্রুটি ঘটেছে।", reply_markup=None)
         except: pass
+
 async def share_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await ensure_user(update)
     share_link = f"https://t.me/{config.BOT_USERNAME}?start=ref_{user['user_id']}"
@@ -393,8 +460,204 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in config.ADMINS: return await update.message.reply_text("এই কমান্ডটি শুধুমাত্র অ্যাডমিনদের জন্য।")
     try:
         await context.bot.send_document(chat_id=user_id, document=open(config.LOCAL_DB, 'rb'), caption=f"✅ ডাটাবেস ব্যাকআপ ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})")
-    except FileNotFoundError: await update.message.reply_text("❌ ডাটাবেস ফাইলটি খুঁজে পাওয়া যায়নি।")
+    except FileNotFoundError: await update.message.reply_text("❌ ডাটাবেস ফাইলটি খুঁজে পাওয়া যায়নি।")
     except Exception as e: await update.message.reply_text(f"❌ একটি ত্রুটি ঘটেছে: {e}")
+
+# --- NEW ADMIN COMMANDS ---
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """সিস্টেম স্ট্যাটিস্টিক্স দেখায়।"""
+    user_id = update.effective_user.id
+    if user_id not in config.ADMINS: return await update.message.reply_text("এই কমান্ডটি শুধুমাত্র অ্যাডমিনদের জন্য।")
+    
+    try:
+        total_users = await db.get_total_users()
+        active_users = await db.get_active_users()
+        total_matches = await db.get_total_matches()
+        pending_deposits = await db.get_pending_deposits_count()
+        pending_withdrawals = await db.get_pending_withdrawals_count()
+        total_fees_collected = await db.get_total_fees_collected()
+        
+        stats_text = f"""
+📊 **বিস্তারিত পরিসংখ্যান**
+
+👥 **ব্যবহারকারী:**
+  • মোট: {total_users}
+  • সক্রিয়: {active_users}
+
+🎮 **ম্যাচ:**
+  • মোট খেলা: {total_matches}
+
+💰 **আর্থিক:**
+  • সংগৃহীত ফি: {total_fees_collected:.2f} TK
+  • অপেক্ষমাণ ডিপোজিট: {pending_deposits}
+  • অপেক্ষমাণ উইথড্র: {pending_withdrawals}
+
+⏰ আপডেট: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in stats_command: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ ত্রুটি: {e}")
+
+async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """নির্দিষ্ট ব্যবহারকারীর তথ্য দেখায়।"""
+    user_id = update.effective_user.id
+    if user_id not in config.ADMINS: return await update.message.reply_text("এই কমান্ডটি শুধুমাত্র অ্যাডমিনদের জন্য।")
+    if not context.args: return await update.message.reply_text("ব্যবহার: /userinfo <user_id>")
+    
+    try:
+        target_user_id = int(context.args[0])
+        user = await db.get_user(target_user_id)
+        
+        if not user:
+            return await update.message.reply_text("এই ব্যবহারকারী পাওয়া যায়নি।")
+        
+        info_text = f"""
+📋 **ব্যবহারকারী তথ্য**
+
+👤 **মৌলিক:**
+  • ID: `{user['user_id']}`
+  • ইউজারনেম: {user['username']}
+  • IGN: {user['ingame_name'] or 'N/A'}
+  • ফোন: {user['phone_number'] or 'N/A'}
+
+🎮 **খেলা:**
+  • জিত: {user['wins']}
+  • পরাজয়: {user['losses']}
+  • ELO: {user['elo_rating']}
+  
+💰 **একাউন্ট:**
+  • ব্যালেন্স: {user['balance']:.2f} TK
+  • রেফারার: {user['referrer_id'] or 'N/A'}
+  • রেজিস্ট্রার্ড: {'হ্যাঁ' if user['is_registered'] else 'না'}
+
+📅 যোগদান: {user['created_at']}
+"""
+        
+        kb = [[InlineKeyboardButton("🔒 ব্যান করুন", callback_data=f"admin_ban_{target_user_id}")],
+              [InlineKeyboardButton("💰 ব্যালেন্স সেট", callback_data=f"admin_setbal_{target_user_id}")]]
+        
+        await update.message.reply_text(info_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    except ValueError:
+        await update.message.reply_text("❌ বৈধ ব্যবহারকারী ID নিন।")
+    except Exception as e:
+        logger.error(f"Error in userinfo_command: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ ত্রুটি: {e}")
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """সকল ব্যবহারকারীকে বার্তা পাঠায়।"""
+    user_id = update.effective_user.id
+    if user_id not in config.ADMINS: return await update.message.reply_text("এই কমান্ডটি শুধুমাত্র অ্যাডমিনদের জন্য।")
+    if not context.args: return await update.message.reply_text("ব্যবহার: /broadcast <বার্তা>")
+    
+    broadcast_text = " ".join(context.args)
+    
+    try:
+        all_users = await db.get_all_user_ids()
+        success_count = 0
+        failed_count = 0
+        
+        await update.message.reply_text(f"📢 {len(all_users)} জন ব্যবহারকারীকে বার্তা পাঠানো হচ্ছে...", parse_mode='Markdown')
+        
+        for uid in all_users:
+            try:
+                await context.bot.send_message(chat_id=uid, text=f"📢 **অ্যাডমিন ঘোষণা:**\n\n{broadcast_text}", parse_mode='Markdown')
+                success_count += 1
+                await asyncio.sleep(0.05)  # Rate limit
+            except (Forbidden, BadRequest):
+                failed_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to send broadcast to {uid}: {e}")
+                failed_count += 1
+        
+        result_text = f"✅ **সম্প্রচার সম্পূর্ণ**\n\n✔️ সফল: {success_count}\n❌ ব্যর্থ: {failed_count}"
+        await update.message.reply_text(result_text, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in broadcast_command: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ ত্রুটি: {e}")
+
+async def matchinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ম্যাচের তথ্য দেখায়।"""
+    user_id = update.effective_user.id
+    if user_id not in config.ADMINS: return await update.message.reply_text("এই কমান্ডটি শুধুমাত্র অ্যাডমিনদের জন্য।")
+    if not context.args: return await update.message.reply_text("ব্যবহার: /matchinfo <match_id>")
+    
+    try:
+        match_id = context.args[0]
+        match = await db.get_match(match_id)
+        
+        if not match:
+            return await update.message.reply_text("ম্যাচ পাওয়া যায়নি।")
+        
+        p1 = await db.get_user(match['player1_id'])
+        p2 = await db.get_user(match['player2_id'])
+        
+        info_text = f"""
+🎮 **ম্যাচ তথ্য**
+
+🔹 আইডি: `{match['match_id']}`
+🔹 স্ট্যাটাস: {match['status']}
+🔹 ফি: {match['fee']:.2f} TK
+
+👥 **খেলোয়াড়:**
+  • P1: {p1['ingame_name']} (ELO: {p1['elo_rating']})
+  • P2: {p2['ingame_name']} (ELO: {p2['elo_rating']})
+
+🎯 **স্ক্রিনশট:**
+  • P1: {'✅' if match.get('p1_screenshot_id') else '⏳'}
+  • P2: {'✅' if match.get('p2_screenshot_id') else '⏳'}
+
+🏆 বিজয়ী: {match.get('winner_id') or 'অপেক্ষণীয়'}
+📅 সময়: {match['created_at']}
+"""
+        await update.message.reply_text(info_text, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in matchinfo_command: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ ত্রুটি: {e}")
+
+async def banuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ব্যবহারকারী ব্যান করে।"""
+    user_id = update.effective_user.id
+    if user_id not in config.ADMINS: return await update.message.reply_text("এই কমান্ডটি শুধুমাত্র অ্যাডমিনদের জন্য।")
+    if not context.args: return await update.message.reply_text("ব্যবহার: /banuser <user_id> [কারণ]")
+    
+    try:
+        target_user_id = int(context.args[0])
+        reason = " ".join(context.args[1:]) if len(context.args) > 1 else "কোনো কারণ উল্লেখ নেই"
+        
+        await db.update_user_fields(target_user_id, {'is_banned': 1})
+        await update.message.reply_text(f"✅ ব্যবহারকারী {target_user_id} ব্যান করা হয়েছে।\n\nকারণ: {reason}")
+        
+        try:
+            await context.bot.send_message(target_user_id, f"❌ **আপনার একাউন্ট ব্যান হয়েছে।**\n\nকারণ: {reason}\n\nআপিল করতে অ্যাডমিনের সাথে যোগাযোগ করুন।")
+        except Exception:
+            pass
+    except ValueError:
+        await update.message.reply_text("❌ বৈধ ব্যবহারকারী ID প্রদান করুন।")
+    except Exception as e:
+        logger.error(f"Error in banuser_command: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ ত্রুটি: {e}")
+
+async def unbanuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ব্যবহারকারীর ব্যান হটায়।"""
+    user_id = update.effective_user.id
+    if user_id not in config.ADMINS: return await update.message.reply_text("এই কমান্ডটি শুধুমাত্র অ্যাডমিনদের জন্য।")
+    if not context.args: return await update.message.reply_text("ব্যবহার: /unbanuser <user_id>")
+    
+    try:
+        target_user_id = int(context.args[0])
+        await db.update_user_fields(target_user_id, {'is_banned': 0})
+        await update.message.reply_text(f"✅ ব্যবহারকারী {target_user_id} আনব্যান করা হয়েছে।")
+        
+        try:
+            await context.bot.send_message(target_user_id, "✅ **সুখবর!** আপনার একাউন্ট পুনরুদ্ধার করা হয়েছে। আবার খেলতে পারেন!")
+        except Exception:
+            pass
+    except ValueError:
+        await update.message.reply_text("❌ বৈধ ব্যবহারকারী ID প্রদান করুন।")
+    except Exception as e:
+        logger.error(f"Error in unbanuser_command: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ ত্রুটি: {e}")
 
 def main():
     db.init_db()
@@ -414,6 +677,14 @@ def main():
     app.add_handler(CommandHandler('setrules', set_rules_command))
     app.add_handler(CommandHandler('freeplay_on', free_play_on_command))
     app.add_handler(CommandHandler('freeplay_off', free_play_off_command))
+    
+    # New Admin commands
+    app.add_handler(CommandHandler('stats', stats_command))
+    app.add_handler(CommandHandler('broadcast', broadcast_command))
+    app.add_handler(CommandHandler('userinfo', userinfo_command))
+    app.add_handler(CommandHandler('matchinfo', matchinfo_command))
+    app.add_handler(CommandHandler('banuser', banuser_command))
+    app.add_handler(CommandHandler('unbanuser', unbanuser_command))
     
     # Message and Callback handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, main_text_handler))

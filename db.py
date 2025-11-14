@@ -31,6 +31,7 @@ def init_db():
     conn = get_conn(); cur = conn.cursor()
     cur.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, ingame_name TEXT, phone_number TEXT, is_registered INTEGER DEFAULT 0, balance REAL DEFAULT 0, welcome_given INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, created_at TIMESTAMP, state TEXT, state_data TEXT, referrer_id INTEGER, elo_rating INTEGER DEFAULT 1000)''')
     _add_column_if_not_exists(cur, 'users', 'elo_rating', 'INTEGER DEFAULT 1000')
+    _add_column_if_not_exists(cur, 'users', 'is_banned', 'INTEGER DEFAULT 0')
     cur.execute('''CREATE TABLE IF NOT EXISTS deposit_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, txid TEXT, amount REAL, status TEXT DEFAULT 'pending', created_at INTEGER)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS withdrawal_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, method TEXT, account_number TEXT, status TEXT DEFAULT 'pending', created_at INTEGER)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, type TEXT, note TEXT, created_at INTEGER)''')
@@ -160,3 +161,47 @@ async def submit_screenshot(match_id, player_id, screenshot_id): return await ru
 def cancel_match_sync(match_id): 
     conn=get_conn();cur=conn.cursor();cur.execute("UPDATE active_matches SET status='cancelled' WHERE match_id=?", (match_id,));conn.commit()
 async def cancel_match(match_id): await run_db(cancel_match_sync, match_id)
+
+# --- NEW PERFORMANCE FUNCTIONS ---
+def get_total_users_sync():
+    """মোট রেজিস্টার্ড ব্যবহারকারী সংখ্যা।"""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as count FROM users WHERE is_registered = 1")
+    return cur.fetchone()['count']
+async def get_total_users(): return await run_db(get_total_users_sync)
+
+def get_active_users_sync():
+    """গত ৭ দিনে সক্রিয় ব্যবহারকারী।"""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(DISTINCT user_id) as count FROM transactions WHERE created_at > ?", (int(time.time()) - 7*86400,))
+    return cur.fetchone()['count']
+async def get_active_users(): return await run_db(get_active_users_sync)
+
+def get_total_matches_sync():
+    """মোট খেলা সংখ্যা।"""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as count FROM active_matches WHERE status = 'completed'")
+    return cur.fetchone()['count']
+async def get_total_matches(): return await run_db(get_total_matches_sync)
+
+def get_pending_deposits_count_sync():
+    """অপেক্ষণীয় ডিপোজিট সংখ্যা।"""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as count FROM deposit_requests WHERE status = 'pending'")
+    return cur.fetchone()['count']
+async def get_pending_deposits_count(): return await run_db(get_pending_deposits_count_sync)
+
+def get_pending_withdrawals_count_sync():
+    """অপেক্ষণীয় উইথড্র সংখ্যা।"""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as count FROM withdrawal_requests WHERE status = 'pending'")
+    return cur.fetchone()['count']
+async def get_pending_withdrawals_count(): return await run_db(get_pending_withdrawals_count_sync)
+
+def get_total_fees_collected_sync():
+    """সংগৃহীত মোট ফি।"""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT SUM(fee) as total FROM active_matches WHERE fee > 0 AND status = 'completed'")
+    result = cur.fetchone()['total']
+    return result or 0
+async def get_total_fees_collected(): return await run_db(get_total_fees_collected_sync)
